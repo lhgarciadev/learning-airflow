@@ -1,0 +1,239 @@
+# ============================================
+# Setup completo: learning-airflow + Astronomer CLI
+# Enfoque: Paquete 'umbrella' (org_biz) con submódulos por dominio
+# ============================================
+
+## 0) Prerrequisitos (en un PC nuevo)
+- Docker Engine / Docker Desktop instalado y corriendo.
+- Astronomer CLI instalado (https://www.astronomer.io/docs/astro/cli/install-cli).
+- (Windows) Usar WSL2 Ubuntu recomendado. Abre el proyecto desde el sistema de archivos de Linux (\wsl$) para evitar problemas de permisos.
+
+Comprobar:
+  docker version
+  astro version
+
+## 1) Clonar o crear el proyecto
+- Si ya tienes el repo remoto: git clone <URL> && cd learning-airflow
+- Si partes de cero:
+  mkdir learning-airflow && cd learning-airflow
+  astro dev init   # crea esqueleto de proyecto
+
+## 2) Estructura final esperada
+learning-airflow/
+├─ Dockerfile
+├─ docker-compose.override.yml
+├─ requirements.txt
+├─ dags/
+│  └─ file_sensor_pipeline.py
+├─ include/
+│  └─ data/
+│     ├─ inbox/
+│     │  └─ archivados/
+│     └─ outbox/
+├─ src/
+│  └─ org_biz/
+│     ├─ __init__.py
+│     ├─ sales/
+│     │  ├─ __init__.py
+│     │  ├─ transforms.py
+│     │  └─ cli.py
+│     ├─ risk/
+│     │  ├─ __init__.py
+│     │  ├─ transforms.py
+│     │  └─ cli.py
+│     └─ students/
+│        ├─ __init__.py
+│        ├─ transforms.py
+│        └─ cli.py
+└─ pyproject.toml
+
+## 3) docker-compose.override.yml
+# Nota: en Runtime recientes de Astronomer el 'webserver' se reemplaza por 'api-server'.
+# Evita definir 'webserver:' si tu runtime no lo usa; usa 'api-server:'.
+services:
+  scheduler:
+    volumes:
+      - ./include/data:/opt/airflow/data
+  api-server:
+    volumes:
+      - ./include/data:/opt/airflow/data
+  triggerer:
+    volumes:
+      - ./include/data:/opt/airflow/data
+
+## 4) requirements.txt (dependencias Python del DAG/proyecto)
+# Manténlo ligero; las deps pesadas van dentro del paquete umbrella si aplica.
+pandas>=2.2.0
+
+## 5) pyproject.toml (paquete umbrella 'org-biz' con extras por dominio y CLI)
+[project]
+name = "org-biz"
+version = "0.1.0"
+description = "Paquete umbrella con lógica de negocio (sales, risk, students) para ETL/ELT"
+requires-python = ">=3.10"
+dependencies = ["pandas>=2.2.0"]
+
+[project.optional-dependencies]
+sales = ["pyarrow"]
+risk = ["scikit-learn>=1.5"]
+students = []
+
+[project.scripts]
+sales-transform = "org_biz.sales.cli:main"
+risk-transform = "org_biz.risk.cli:main"
+students-transform = "org_biz.students.cli:main"
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+## 6) Código del paquete umbrella (mínimo viable)
+# 6.1 src/org_biz/__init__.py
+# (vacío o con metadatos)
+
+# 6.2 src/org_biz/sales/transforms.py
+from pathlib import Path
+from datetime import datetime
+import pandas as pd
+
+def transform_csv(src_path: str, out_dir: str) -> str:
+    df = pd.read_csv(src_path)
+    df.columns = [c.strip().lower().replace(" ", "_") for c in df.columns]
+    if "monto" in df.columns:
+        df["monto"] = pd.to_numeric(df["monto"], errors="coerce").fillna(0)
+    df["processed_at"] = datetime.utcnow().isoformat()
+
+    src = Path(src_path)
+    out = Path(out_dir) / f"{src.stem}_processed{src.suffix}"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(out, index=False)
+    return str(out)
+
+# 6.3 src/org_biz/sales/cli.py
+import argparse
+from .transforms import transform_csv
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--src", required=True)
+    p.add_argument("--out-dir", required=True)
+    args = p.parse_args()
+    path = transform_csv(args.src, args.out_dir)
+    print(path)
+
+# 6.4 (Opcional) replicas en risk/students con su propia lógica
+
+## 7) Dockerfile (instalar paquete umbrella en build con extras)
+# Partimos de la imagen Runtime de Astronomer. Ajusta la versión a la que uses en tu proyecto.
+FROM quay.io/astronomer/astro-runtime:10.3.0
+
+# Instalar dependencias globales del proyecto (si las hubiera)
+COPY requirements.txt /tmp/requirements.txt
+RUN pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Copiar metadata + código del paquete umbrella y *luego* instalar (aprovecha caché)
+COPY pyproject.toml /tmp/build/pyproject.toml
+COPY src/ /tmp/build/src/
+RUN pip install --no-cache-dir "/tmp/build[sales,risk,students]"
+
+# Copiar el resto del proyecto (DAGs, etc.)
+# Nota: Astronomer CLI gestiona el mapeo de 'dags', 'plugins', etc. en dev.
+# Si necesitas archivos adicionales, puedes copiarlos aquí.
+
+## 8) DAG de orquestación (dags/file_sensor_pipeline.py)
+from __future__ import annotations
+import os, glob
+from datetime import datetime
+from jinja2 import Template
+import pendulum
+from airflow import DAG
+from airflow.providers.standard.operators.python import PythonOperator
+from airflow.providers.standard.sensors.python import PythonSensor
+from airflow.sdk import get_current_context
+from org_biz.sales.transforms import transform_csv
+
+INBOX_DIR = "/opt/airflow/data/inbox"
+OUTBOX_DIR = "/opt/airflow/data/outbox"
+FILE_PATTERN = "ventas_{{ ds_nodash }}.csv"  # o usa Variable de Airflow
+
+def _rendered_glob_pattern() -> str:
+    ctx = get_current_context()
+    pattern = Template(FILE_PATTERN).render(**ctx)
+    return os.path.join(INBOX_DIR, pattern)
+
+def wait_for_file_callable() -> bool:
+    pattern = _rendered_glob_pattern()
+    return len(glob.glob(pattern)) > 0
+
+def get_first_match_path() -> str:
+    pattern = _rendered_glob_pattern()
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(f"No se encontró archivo con patrón: {pattern}")
+    return matches[0]
+
+def transform_task():
+    ctx = get_current_context()
+    src_path = ctx["ti"].xcom_pull(task_ids="get_input_file", key="return_value")
+    return transform_csv(src_path, OUTBOX_DIR)
+
+with DAG(
+    dag_id="file_sensor_pipeline",
+    description="Espera archivo, invoca lógica del paquete umbrella y deja salida en outbox.",
+    start_date=pendulum.datetime(2024, 1, 1, tz="America/Bogota"),
+    schedule="@daily",
+    catchup=False,
+    max_active_runs=1,
+    default_args={"owner": "analytics", "retries": 0},
+    tags=["files", "sensors"],
+) as dag:
+    wait_for_file = PythonSensor(
+        task_id="wait_for_file",
+        python_callable=wait_for_file_callable,
+        poke_interval=30,
+        timeout=60*60*6,
+        mode="reschedule",
+    )
+    get_input_file = PythonOperator(
+        task_id="get_input_file", python_callable=get_first_match_path
+    )
+    transform = PythonOperator(
+        task_id="transform", python_callable=transform_task
+    )
+    wait_for_file >> get_input_file >> transform
+
+## 9) Preparar carpetas de intercambio (en el host)
+mkdir -p include/data/inbox include/data/inbox/archivados include/data/outbox
+
+## 10) Levantar el proyecto en dev
+astro dev stop || true
+astro dev start
+# UI Airflow: http://localhost:8080
+
+## 11) Verificar montaje del volumen
+astro dev bash -s scheduler
+ls -la /opt/airflow/data
+exit
+
+## 12) Prueba end-to-end (archivo de ejemplo)
+printf "id,cliente,monto\n1,Ana,123.45\n2,Camilo,200\n" > include/data/inbox/ventas_$(date +%Y%m%d).csv
+
+# El sensor debería detectar el archivo, ejecutar la transformación
+# y dejar el resultado en include/data/outbox/ventas_YYYYMMDD_processed.csv
+# Mueve el original a include/data/inbox/archivados/
+
+## 13) Opcionales recomendados
+- Usar Variable de Airflow 'FILE_PATTERN' para cambiar patrón sin editar DAG.
+- Parametrizar rutas INBOX/OUTBOX vía Variables.
+- Añadir tests del paquete umbrella con pytest.
+- Publicar wheels del paquete umbrella en un repositorio interno y pinear versión.
+- En CI/CD: construir la imagen instalando 'org-biz==<versión>' y promover entre ambientes.
+
+## 14) Troubleshooting
+- Si ves: "service 'webserver' has neither an image nor a build context specified":
+  - Tu runtime usa 'api-server' en lugar de 'webserver'. Ajusta docker-compose.override.yml.
+- En Windows/WSL con NTFS, 'chmod' puede fallar: ignora; con Astronomer dev no es necesario.
+- Si el DAG no avanza, comprueba el nombre esperado por el sensor ({{ ds_nodash }}) y la TZ del DAG.
+- Para evitar bloquear workers cuando espera archivo: usa mode="reschedule" en PythonSensor.
+
+# Fin del setup

@@ -1,0 +1,10 @@
+services:
+  scheduler:
+    volumes:
+      - ./include/data:/opt/airflow/data
+  api-server:
+    volumes:
+      - ./include/data:/opt/airflow/data
+  triggerer:
+    volumes:
+      - ./include/data:/opt/airflow/data
